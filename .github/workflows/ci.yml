@@ -1,15 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags:
-      # Tags for all potential release numbers till 2030.
-      - "2[0-9].[0-3]" # 20.0 -> 29.3
-      - "2[0-9].[0-3].[0-9]+" # 20.0.0 -> 29.3.[0-9]+
-  pull_request:
-  schedule:
-    - cron: 0 0 * * MON # Run every Monday at 00:00 UTC
   workflow_dispatch:
     # allow manual runs on branches without a PR
 
@@ -17,6 +8,21 @@ env:
   # The "FORCE_COLOR" variable, when set to 1,
   # tells Nox to colorize itself.
   FORCE_COLOR: "1"
+  # Keep pytest's own output uncoloured so the "N passed" summary lines are
+  # plain text in the job logs. pyproject.toml's addopts forces --color=yes
+  # (and ships in the sdist, so it stays untouched); PYTEST_ADDOPTS is
+  # applied after the ini addopts, so this overrides it.
+  PYTEST_ADDOPTS: "--color=no"
+  # The runner's current git starts detached auto-maintenance after
+  # `git commit`, which transiently creates .git/objects/maintenance.lock
+  # while scripttest snapshots the scratch tree (FileNotFoundError in
+  # tests/functional/test_vcs_git.py). Env-level config survives the test
+  # suite's HOME/system-config isolation.
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: maintenance.auto
+  GIT_CONFIG_VALUE_0: "false"
+  GIT_CONFIG_KEY_1: gc.auto
+  GIT_CONFIG_VALUE_1: "0"
 
 permissions:
   contents: read
@@ -29,6 +35,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -42,6 +49,7 @@ jobs:
 
   determine-changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tests: ${{ steps.filter.outputs.tests }}
       vendoring: ${{ steps.filter.outputs.vendoring }}
@@ -70,6 +78,7 @@ jobs:
   packaging:
     name: packaging / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -94,6 +103,7 @@ jobs:
   vendoring:
     name: vendoring
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     needs: [determine-changes]
     if: >-
@@ -115,6 +125,7 @@ jobs:
   tests-unix:
     name: tests / ${{ matrix.python.version || matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
 
     needs: [determine-changes]
     if: >-
@@ -122,7 +133,7 @@ jobs:
       github.event_name != 'pull_request'
 
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         python:
@@ -131,7 +142,10 @@ jobs:
           - "3.12"
           - "3.13"
           - "3.14"
-          - "3.15"
+          # Pinned to the prerelease that existed when 26.1.1 was released;
+          # a bare "3.15" resolves to a newer prerelease whose changed
+          # user-site semantics break the functional suite.
+          - { key: "3.15", version: "3.15.0-alpha.8" }
           - "3.14t"
         include:
           # Oldest patch release per minor version on ubuntu-latest,
@@ -180,10 +194,22 @@ jobs:
 
       - run: pip install nox
 
+      # Python 3.15 is pinned to a release-era alpha; test dependencies
+      # published later (markupsafe cp315 wheels, cryptography abi3t wheels)
+      # are built against a newer 3.15 ABI that the alpha cannot load.
+      # Pre-provision the nox env from the registry as of the 26.1.1 release
+      # date, and reuse that env below so PIP_INDEX_URL never reaches the
+      # test runs.
+      - name: Pre-install test environment (3.15 alpha)
+        if: matrix.python.key == '3.15'
+        env:
+          PIP_INDEX_URL: https://:2026-05-04T19:02:18.900185Z@time-machines-pypi.sealsecurity.io/
+        run: nox -s test-3.15 --install-only
+
       # Main check
       - name: Run unit tests
         run: >-
-          nox -s test-${{ matrix.python.key || matrix.python }} --
+          nox -s test-${{ matrix.python.key || matrix.python }} ${{ matrix.python.key == '3.15' && '--no-install' || '' }} --
           tests/unit
           --verbose --numprocesses auto --showlocals
       - name: Run integration tests
@@ -194,8 +220,9 @@ jobs:
           --durations=15
 
   tests-windows:
-    name: tests / ${{ matrix.python }} / ${{ matrix.os }} / ${{ matrix.group.number }}
+    name: tests / ${{ matrix.python.key || matrix.python }} / ${{ matrix.os }} / ${{ matrix.group.number }}
     runs-on: ${{ matrix.os }}-latest
+    timeout-minutes: 50
 
     needs: [determine-changes]
     if: >-
@@ -203,7 +230,7 @@ jobs:
       github.event_name != 'pull_request'
 
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: [Windows]
         python:
@@ -214,7 +241,10 @@ jobs:
           # - "3.12"
           # - "3.13"
           - "3.14"
-          - "3.15"
+          # Pinned to the prerelease that existed when 26.1.1 was released;
+          # a bare "3.15" resolves to a newer prerelease whose changed
+          # user-site semantics break the functional suite.
+          - { key: "3.15", version: "3.15.0-alpha.8" }
           - "3.14t"
         group:
           - { number: 1, pytest-filter: "not test_install" }
@@ -233,7 +263,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: ${{ matrix.python }}
+          python-version: ${{ matrix.python.version || matrix.python }}
           allow-prereleases: true
 
       - name: Set PYTHON_GIL
@@ -254,17 +284,29 @@ jobs:
 
       - run: pip install nox
 
+      # Python 3.15 is pinned to a release-era alpha; test dependencies
+      # published later (markupsafe cp315 wheels, cryptography abi3t wheels)
+      # are built against a newer 3.15 ABI that the alpha cannot load.
+      # Pre-provision the nox env from the registry as of the 26.1.1 release
+      # date, and reuse that env below so PIP_INDEX_URL never reaches the
+      # test runs.
+      - name: Pre-install test environment (3.15 alpha)
+        if: matrix.python.key == '3.15'
+        env:
+          PIP_INDEX_URL: https://:2026-05-04T19:02:18.900185Z@time-machines-pypi.sealsecurity.io/
+        run: nox -s test-3.15 --install-only
+
       # Main check
       - name: Run unit tests (group 1)
         if: matrix.group.number == 1
         run: >-
-          nox -s test-${{ matrix.python }} --
+          nox -s test-${{ matrix.python.key || matrix.python }} ${{ matrix.python.key == '3.15' && '--no-install' || '' }} --
           tests/unit
           --verbose --numprocesses auto --showlocals
 
       - name: Run integration tests (group ${{ matrix.group.number }})
         run: >-
-          nox -s test-${{ matrix.python }} --no-install --
+          nox -s test-${{ matrix.python.key || matrix.python }} --no-install --
           tests/functional -k "${{ matrix.group.pytest-filter }}"
           --verbose --numprocesses auto --showlocals --durations=15
 
@@ -274,6 +316,7 @@ jobs:
     # beating out the ubuntu-latest runners. The zipapp tests are slow by
     # nature, and we don't care where they run, so we pick the fastest one.
     runs-on: macos-latest
+    timeout-minutes: 30
 
     needs: [packaging, determine-changes]
     if: >-
@@ -315,6 +358,7 @@ jobs:
       - vendoring
 
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Decide whether the needed jobs succeeded or failed

@@ -12,7 +12,7 @@ from pip._internal.exceptions import HashMismatch
 from pip._internal.models.link import Link
 from pip._internal.network.download import Downloader
 from pip._internal.network.session import PipSession
-from pip._internal.operations.prepare import unpack_url
+from pip._internal.operations.prepare import _check_download_dir, unpack_url
 from pip._internal.utils.hashes import Hashes
 
 from tests.lib import TestData
@@ -89,6 +89,53 @@ def test_download_http_url__no_directory_traversal(
     actual = os.listdir(download_dir)
     assert actual == ["out_dir_file"]
     mock_raise_for_status.assert_called_once_with(resp)
+
+
+@patch("pip._internal.network.download.raise_for_status")
+def test_download_http_url__no_directory_traversal_via_link_path(
+    mock_raise_for_status: Mock, tmpdir: Path
+) -> None:
+    """
+    Test that directory traversal doesn't happen on download when the URL
+    path carries a doubly percent-encoded "../" in its file name.
+    """
+    mock_url = "http://www.example.com/%252e%252e%252fout_dir_file.tgz"
+    contents = b"downloaded"
+    link = Link(mock_url)
+
+    session = Mock()
+    session.resume_retries = 0
+    resp = MockResponse(contents)
+    resp.url = mock_url
+    resp.headers = {"content-type": "random"}
+    session.get.return_value = resp
+    download = Downloader(session, progress_bar="on")
+
+    download_dir = os.fspath(tmpdir.joinpath("download"))
+    os.mkdir(download_dir)
+    file_path, content_type = download(link, download_dir)
+    # The file should be downloaded to download_dir, keeping its single
+    # decoded name, and nothing should be written to its parent.
+    assert os.path.dirname(file_path) == download_dir
+    assert os.listdir(download_dir) == ["%2e%2e%2fout_dir_file.tgz"]
+    assert not tmpdir.joinpath("out_dir_file.tgz").exists()
+    mock_raise_for_status.assert_called_once_with(resp)
+
+
+def test_check_download_dir__no_directory_traversal_via_link_path(
+    tmpdir: Path,
+) -> None:
+    """
+    Test that a previously downloaded file is only looked up inside the
+    download directory, even when the URL path carries a doubly
+    percent-encoded "../" in its file name.
+    """
+    download_dir = os.fspath(tmpdir.joinpath("download"))
+    os.mkdir(download_dir)
+    tmpdir.joinpath("out_dir_file.tgz").write_bytes(b"outside")
+
+    link = Link("http://www.example.com/%252e%252e%252fout_dir_file.tgz")
+    assert _check_download_dir(link, download_dir, None) is None
 
 
 @pytest.fixture
